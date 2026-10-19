@@ -1,0 +1,31 @@
+{
+  "rig": {
+    "api": "http://192.0.2.10:8080",
+    "machine": "Rig",
+    "ssh": "user@192.0.2.10",
+    "os": "linux",
+    "yaml": "/opt/llm/llama-swap.yaml",
+    "model_root": "/opt/llm/models",
+    "master": "~/lab-config/rig/llama-swap.yaml",
+    "log_cmd": "journalctl -u llama-swap -n 3000 --no-pager 2>/dev/null | grep -avE 'GET /running|GET /v1/models|metrics/activity' | tail -120",
+    "split_macros": {},
+    "no_offload": false,
+    "preferred": null
+  },
+  "pair-a": {
+    "api": "http://192.0.2.20:8888",
+    "machine": "Pair A",
+    "ssh": "user@192.0.2.20",
+    "peers": ["user@192.0.2.21"],
+    "hardware": "Head Box Model + Worker Box Model",
+    "os": "linux",
+    "engine": "vllm",
+    "yaml": null,
+    "model_root": null,
+    "master": "",
+    "log_cmd": "docker logs --tail 3000 $(docker ps --format '{{.Names}}' | grep -m1 vllm) 2>&1 | grep -avE '\"(GET|POST) /' | tail -120",
+    "split_macros": {},
+    "no_offload": false,
+    "preferred": null
+  }
+}

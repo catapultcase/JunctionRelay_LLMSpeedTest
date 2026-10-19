@@ -1,0 +1,4 @@
+__pycache__/
+results/
+targets.json
+.env
