@@ -542,7 +542,7 @@ def vllm_launch(t, model):
         if argv and (("--served-model-name" in argv and argv[argv.index("--served-model-name") + 1] == model)
                      or (len(argv) > 1 and os.path.basename(argv[0]).startswith("tensorfold") and argv[1] == "serve"
                          and "--name" in argv[:-1] and argv[argv.index("--name") + 1] == model)):   # tensorfold or tensorfold-native (Zig)
-            hf = next((m["Source"] for m in mounts if m["Destination"].endswith(".cache/huggingface")), None)
+            hf = next((m["Source"] for m in mounts if m["Destination"].endswith(".cache/huggingface") or m["Destination"] == "/hf"), None)   # /hf: the DeepSeek-V4.1 recipe
             return argv, env or [], hf
     return [], [], None
 
@@ -579,10 +579,11 @@ def quant_of(root):
     'NVFP4-Mia', 'EXL3-4bpw-Mia', 'MLX-4bit-Vontra', 'FP8' (nvidia). The archive folders and
     the HUD use the same spelling (ARCHITECTURE.md, 'a third party's quant carries its publisher')."""
     name = root.split("/")[-1]
-    q = re.search(r"(EXL3-?\d(?:\.\d+)?bpw|MLX-\d+bit|NVFP4(?:-[A-Z]+)?|FP8|AWQ|BF16)", name, re.I)
+    q = re.search(r"(EXL3-?(?:EAQ-v[\d.]+-)?\d(?:\.\d+)?-?bpw|MLX-\d+bit|NVFP4(?:-[A-Z]+)?|FP8|AWQ|BF16)", name, re.I)
     if not q:
         return None
-    quant = re.sub(r"^EXL3-?", "EXL3-", q.group(1), flags=re.I)
+    # EXL3-4bpw, and Mia's EAQ builds (EXL3-EAQ-v1-2.9-bpw) in the same spelling: EXL3-2.9bpw
+    quant = re.sub(r"^EXL3-?(?:EAQ-v[\d.]+-)?(\d(?:\.\d+)?)-?bpw", r"EXL3-\1bpw", q.group(1), flags=re.I)
     org = root.split("/")[0] if "/" in root else ""
     if org and org.lower() not in VENDOR_ORGS:
         quant += "-" + re.split(r"[-_]", org)[0]
@@ -615,6 +616,8 @@ def config_tensorfold(t, model):
     kv_env = next((e.split("=", 1)[1] for e in env if e.startswith("TF_GLM_KV=")), None)
     if flag("--kv-dtype") or kv_env:
         cfg["cache_k"] = cfg["cache_v"] = flag("--kv-dtype") or kv_env
+    elif "tensorfold-dsv41" in image:   # DeepSeek-V4.1's engine takes no KV dtype: the model's own layout
+        cfg["cache_k"] = cfg["cache_v"] = "native"
     if flag("--tp"):
         cfg["tensor_parallel"] = int(flag("--tp"))
     # Drafting: an MTP head (Flash-Next) or a DFlash2 drafter checkpoint (--drafter, the GLM pair);
@@ -633,6 +636,13 @@ def config_tensorfold(t, model):
     m = re.search(r"models--([^/]+)--([^/]+)(?:/|$)", root)
     if m:
         root = f"{m.group(1)}/{m.group(2)}"          # the cache path names the repo
+    elif root.startswith("/hf/") and hf:
+        # DeepSeek-V4.1's recipe serves a folder of links into the HF cache (/hf/tensorfold-dsv41/<rev>/model):
+        # one link names the repo (2026-10-23: its rows had posted with no quant)
+        _, ln = _ssh(t, f"readlink -f '{hf}{root[3:]}/config.json'")
+        m = re.search(r"models--([^/]+)--([^/]+)/", ln or "")
+        if m:
+            root = f"{m.group(1)}/{m.group(2)}"
     if "--no-thinking" in argv:
         cfg["thinking_default"] = "off"
     elif "--thinking" in argv:
@@ -646,7 +656,7 @@ def config_tensorfold(t, model):
     q = quant_of(root)
     if q:
         cfg["quant"] = q
-    cfg["source_repo"] = source_repo(t, argv[2] if len(argv) > 2 else "")
+    cfg["source_repo"] = source_repo(t, root if re.fullmatch(r"[\w.-]+/[\w.-]+", root) else (argv[2] if len(argv) > 2 else ""))
     if hf and root:
         code, out = _ssh(t, f"du -sbL '{hf}/hub/models--{root.replace('/', '--')}/snapshots' | cut -f1")
         if code == 0 and out.strip().isdigit():
