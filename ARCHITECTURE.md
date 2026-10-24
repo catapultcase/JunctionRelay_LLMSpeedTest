@@ -12,7 +12,7 @@ suite names).
 | scenario | prompt | metrics |
 |---|---|---|
 | `4k` `16k` `32k` `64k` `128k` `256k` | the frozen corpus cut to that many tokens (cycled past 51.4K), salted, `cache_prompt=false` | `prompt_tok_s` (prefill of the whole prompt), `gen_tok_s` (next 128 tokens), `ttft_s` (server `prompt_ms`), `draft_accept`, `gpu_watts_avg` |
-| `4k_x4` | four streams at 4K | `gen_tok_s` (mean per stream), `gen_tok_s_aggregate` |
+| `32k_x4` (v5; the deepest rung that fits, 4K floor) | N streams at that depth, tg1024 | `gen_tok_s` (mean per stream, with its overlap factor and a WARNING note when the streams never overlapped), `gen_tok_s_aggregate` |
 | — | after the run | `vram_gb`; `disk_read_mbs` and `vram_shared_gb` on the deepest rung |
 
 Every rung the window allows runs (`k·1000 + 640 ≤ ctx`). `--quick` = 4k, 32k, 128k;
@@ -21,7 +21,9 @@ reports. This is the shape published numbers take (`llama-bench -d`, the vLLM/ML
 
 v1–v2 (`shallow` / `deep` / `review` / `parallel_x4`) are retired with their history. v3 was this
 ladder on a private corpus; v4 swapped in a public one (`corpus/README.md`), so any lab's cells
-compare with any other's.
+compare with any other's. v5 rebuilt the concurrency rung only: the ladder above is unchanged, but
+v4's `4k_x4` cells were driven at tg128 against a ~9 s prefill queue and are not comparable to
+v5's sustained `<depth>_xN` runs.
 
 ## Setup
 
@@ -125,10 +127,17 @@ that collides with a served name gets a suffix (`-ram37`); the row key ignores t
 
 ## Lessons learned
 
-- **`gen_tok_s_aggregate` is not decode throughput.** It is output over wall clock INCLUDING prefill,
-  so on `4k_x4` it is mostly prefill time. Read as "what the box writes with four streams" it said
-  Spark A does not scale (41.5 against 40 alone) and a wrong rule went into OpenCode's `AGENTS.md`
-  (2026-10-01). Concurrent decode is `gen_tok_s` x streams: 22 each, 87 in total.
+- **`gen_tok_s_aggregate` is output over wall clock INCLUDING prefill.** At a 4K prompt it was mostly
+  prefill time, and read as "what the box writes with four streams" it said Spark A does not scale
+  (41.5 against 40 alone) and a wrong rule went into OpenCode's `AGENTS.md` (2026-10-01). The v5
+  concurrency rung drives tg1024 at the deepest rung that fits, so prefill is a smaller share and the
+  row carries its overlap factor. **Read both figures together:** per stream, `each` is the rate a
+  stream gets while the run decodes; across the box, `total` is what four sessions receive together.
+- **A short decode window measures the scheduler, not the box.** v4's `4k_x4` (tg128) spent ~2 s
+  decoding per stream against ~9 s of serialized 4k prefills. On the coding pair that made every
+  stream decode nearly alone: `each` read 67.3 - its solo speed - inside a 4-stream test, while the
+  total was 30.3. `each > total` is the tell; the v5 row now states the overlap and warns
+  (2026-10-24).
 - **The corpus is real text for a reason.** Random filler measures the same prefill but
   says nothing about generation at depth; the review ask at the end keeps the 128
   generated tokens honest.

@@ -89,14 +89,26 @@ SOURCE = "LLMSpeedTest bench.py"
 #   4  2026-10-18: a PUBLIC corpus, so any lab can run the suite and compare: three sections of
 #      the Kubernetes concepts docs (corpus/README.md) replace the Homelab docs snapshot. Same
 #      ladder and the same review ask; the prompt text differs, so v3 cells do not carry over.
+#   5  2026-10-24: THE CONCURRENCY RUNG REBUILT. The `<depth>_xN` stage runs tg1024 at the
+#      deepest rung the per-request window fits (32K down to 4K), so the decode windows
+#      outlast the serialized prefills and the streams actually overlap; the row carries its
+#      overlap factor and a WARNING note when they did not (each > total, or summed decode
+#      time under 1.5x wall). v4's stage drove 4K prompts at tg128 - ~2 s of decode against a
+#      ~9 s prefill queue - so on an engine that staggers streams its "each" was solo speed
+#      measured inside a 4-stream test (the coding pair read "67 each / 30 total"). v4 xN
+#      cells are not comparable to v5's; JR keeps the eras apart. The depth LADDER is
+#      unchanged - only the concurrency rung moved.
 SUITE = "LLMSpeedTest"
 SUITE_NAME = "JR Speed Test"   # JR shows the suite by its own name (BENCHMARK-CONTRACT.md)
-SUITE_VERSION = "4"
+SUITE_VERSION = "5"
 CORPUS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "corpus", "kubernetes")
 CORPUS_TOKENS = 51_400       # measured 2026-10-18 on GLM-5.3-Flash's tokenizer; calibrates chars/token
 DEPTHS = (4, 16, 32, 64, 128, 256)   # K tokens; the ladder
 QUICK_DEPTHS = (4, 32, 128)
 TG_TOKENS = 128              # tg128: the industry decode length
+TG_X = 1024                  # the concurrency rung's decode length (v5): the run must
+                             # outlast the serialized prefills or the streams never
+                             # decode together and "each" is solo speed (see the v5 era note)
 LLB_DEPTHS = (4, 32, 128)    # --llama-bench: pp512 / tg128 at these K-token depths, the community's table
 OPENCLAW_CFG = os.path.expanduser("~/.openclaw/openclaw.json")
 REQUEST_TIMEOUT = 600  # a cold model load rides the first request
@@ -389,6 +401,16 @@ def tf_deltas(d):
     n = d.get("health_requests_total") or d.get("request_latency_seconds_count") or d.get("e2e_request_latency_seconds_count") or 0
     if d.get("health_prefill_seconds_total") is not None and "health_prefill_seconds_total" in d:
         prefill, decode = d.get("health_prefill_seconds_total", 0), d.get("health_decode_seconds_total", 0)
+    elif (d.get("request_prefill_time_seconds_sum") is not None
+          or d.get("request_decode_time_seconds_sum") is not None
+          or d.get("request_decode_seconds_sum") is not None):
+        # The build states its own phase seconds per request (exl3-tp2 dsv41 does). Prefer
+        # those over inferring: request_latency - ttft is the first-to-last-token SPAN, and
+        # a stream descheduled while another's prefill ran pays that gap in the span.
+        prefill = d.get("request_prefill_time_seconds_sum", d.get("request_prefill_seconds_sum", 0.0))
+        decode = d.get("request_decode_time_seconds_sum", d.get("request_decode_seconds_sum", 0.0))
+        if not decode:
+            decode = max(0.0, d.get("request_latency_seconds_sum", 0.0) - prefill)
     else:
         ttft = d.get("time_to_first_token_seconds_sum", 0)
         prefill, decode = ttft, max(0.0, d.get("request_latency_seconds_sum", 0) - ttft)
@@ -1403,26 +1425,35 @@ def bench_model(api, model, machine, parallel_n, ssh_host, submit, os_kind="linu
               + (f", {w} W" if w else "") + (f", {d} MB/s disk" if d else "")
               + (f", {shared} GB shared" if shared is not None else ""))
 
-    # Concurrency: parallel_n streams at 4K, tg128 each - always 4K, whatever
-    # --depths asked for: four 32K prompts overflow a 4-slot 32K window's shared
-    # KV and read "no clean streams" (2026-09-25).
-    rungs_x = [4] if rungs and not crashed else []
-    if rungs_x:
+    # Concurrency (v5): parallel_n streams at tg1024, at the deepest rung where
+    # every stream fits its prompt + output in the window one request gets - 32K
+    # down to 4K. v4 ran this stage tg128 at a fixed 4K: ~2 s of decode per stream
+    # against a queue of serialized prefills, so on an engine that staggers streams
+    # each one decoded essentially alone and "each" was solo speed inside a
+    # 4-stream test (2026-10-24: "67 each / 30 total" on the coding pair - 67 was
+    # its solo figure, real telemetry measured at zero overlap). A decode window
+    # that outlasts the prefill queue is what makes `each` mean "per stream with
+    # N streams flying". 4K stays the floor; four 32K prompts still overflow a
+    # 4-slot 32K window's KV and read "no clean streams" (2026-09-25).
+    x_depth = next((k for k in (32, 16, 8, 4)
+                    if not ctx or k * 1000 + TG_X + 1024 <= ctx), 4) if rungs and not crashed else None
+    if x_depth:
+        scen = f"{x_depth}k_x{parallel_n}"
         results, threads = [None] * parallel_n, []
         watts = WattsSampler(ssh_host) if ssh_host else None
         start = time.time()
         for i in range(parallel_n):
             def work(idx=i):
                 try:
-                    results[idx] = run_one(api, model, ladder_prompt(rungs_x[0], stream=idx),
-                                           TG_TOKENS, cache_prompt=False, timeout=3600)
+                    results[idx] = run_one(api, model, ladder_prompt(x_depth, stream=idx),
+                                           TG_X, cache_prompt=False, timeout=3600)
                 except Exception as e:
                     results[idx] = {"error": str(e)}
             threads.append(threading.Thread(target=work))
         if vllm:
             try:
-                results = run_vllm(api, model, lambda: [ladder_prompt(rungs_x[0], stream=i) for i in range(parallel_n)],
-                                   TG_TOKENS, timeout=3600)
+                results = run_vllm(api, model, lambda: [ladder_prompt(x_depth, stream=i) for i in range(parallel_n)],
+                                   TG_X, timeout=3600)
                 start = time.time() - results[0]["wall"]
             except Exception as e:
                 results = [{"error": str(e)}] * parallel_n
@@ -1435,15 +1466,28 @@ def bench_model(api, model, machine, parallel_n, ssh_host, submit, os_kind="linu
         par_w = watts.mean() if watts else None
         good = [r for r in results if r and not r.get("error")
                 and r["output_tokens"] >= 2 and r["gen_tps"]]
-        scen = f"{rungs_x[0]}k_x{parallel_n}"
         if good:
-            row("gen_tok_s", sum(r["gen_tps"] for r in good) / len(good), scen,
-                f"mean of {len(good)}/{parallel_n} streams, {rungs_x[0]}k prompt each, tg{TG_TOKENS}")
-            row("gen_tok_s_aggregate", sum(r["output_tokens"] for r in good) / wall,
-                scen, f"{len(good)}/{parallel_n} streams, {wall:.1f}s wall incl. prefill")
+            each = sum(r["gen_tps"] for r in good) / len(good)
+            gtoks = sum(r["output_tokens"] for r in good)
+            agg = gtoks / wall
+            # The overlap check: summed per-stream decode time over the run's wall.
+            # ~N means the streams really decoded together; ~1 means the engine
+            # serialized them and `each` is (near-)solo speed wearing a concurrency
+            # label. The row says so out loud - a reader must never have to redo
+            # this arithmetic to trust a cell (2026-10-24).
+            overlap = (gtoks - len(good)) / (each * wall) if each and wall else None
+            note = (f"mean of {len(good)}/{parallel_n} streams, {x_depth}k prompt each, tg{TG_X}"
+                    + (f", overlap x{overlap:.1f}" if overlap else ""))
+            if len(good) >= 2 and (each > agg or (overlap and overlap < 1.5)):
+                note += (" - WARNING the streams' decode windows barely overlapped: the engine"
+                         " serialized the run, so each reads near-solo and the aggregate is the"
+                         " honest figure for concurrent use")
+            row("gen_tok_s", each, scen, note)
+            row("gen_tok_s_aggregate", agg, scen, f"{len(good)}/{parallel_n} streams, {wall:.1f}s wall incl. prefill")
             if par_w:
                 row("gpu_watts_avg", par_w, scen, "all GPUs summed across every box of the target (a pair: both), 1s samples via nvidia-smi over ssh")
-            print(f"  {scen}: {len(good)}/{parallel_n} clean streams"
+            print(f"  {scen}: {len(good)}/{parallel_n} clean streams, each {each:.1f} / total {agg:.1f} tok/s"
+                  + (f", overlap x{overlap:.1f}" if overlap else "")
                   + (f", {par_w} W" if par_w else ""))
         else:
             print(f"  {scen}: no clean streams")
