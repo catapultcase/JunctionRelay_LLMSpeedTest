@@ -111,19 +111,46 @@ TG_X = 1024                  # the concurrency rung's decode length (v5): the ru
                              # decode together and "each" is solo speed (see the v5 era note)
 LLB_DEPTHS = (4, 32, 128)    # --llama-bench: pp512 / tg128 at these K-token depths, the community's table
 OPENCLAW_CFG = os.path.expanduser("~/.openclaw/openclaw.json")
+OPENCODE_CFG = os.path.expanduser("~/.config/opencode/opencode.json")
 REQUEST_TIMEOUT = 600  # a cold model load rides the first request
 
 
 # ---------------------------------------------------------------- MCP client
 
+def jr_credentials():
+    """(url, Authorization header) for JR's MCP, in one place per box: an explicit
+    JR_MCP_URL + JR_MCP_TOKEN wins, else openclaw's lab-dev entry (otago), else this
+    machine's own OpenCode client config's junction-relay entry (fw13). The token is
+    never printed; it goes straight into the request header."""
+    url, tok = os.environ.get("JR_MCP_URL"), os.environ.get("JR_MCP_TOKEN")
+    if url and tok:
+        return url, tok if tok.startswith("Bearer ") else "Bearer " + tok
+    try:
+        s = json.load(open(OPENCLAW_CFG))["mcp"]["servers"]["lab-dev"]
+        return s["url"], s["headers"]["Authorization"]
+    except (OSError, KeyError, ValueError):
+        pass
+    try:
+        for name, s in (json.load(open(OPENCODE_CFG)).get("mcp") or {}).items():
+            hdr = (s.get("headers") or {}).get("Authorization")
+            if s.get("url") and hdr and "junction" in name.lower():
+                return s["url"], hdr
+    except (OSError, KeyError, ValueError):
+        pass
+    raise SystemExit(
+        "No JR MCP credentials on this box: set JR_MCP_URL + JR_MCP_TOKEN, or add the "
+        "junction-relay MCP entry (url + Authorization header) to ~/.config/opencode/"
+        "opencode.json, or openclaw's lab-dev entry to ~/.openclaw/openclaw.json.")
+
+
 class JRMcp:
     """Minimal MCP streamable-HTTP client. Credentials come from openclaw's
-    lab-dev server entry so there is exactly one place they live."""
+    lab-dev server entry so there is exactly one place they live; a box that runs
+    the suite without openclaw (fw13, 2026-10-24) falls back to its own client
+    config's junction-relay entry, and JR_MCP_URL + JR_MCP_TOKEN override both."""
 
     def __init__(self):
-        s = json.load(open(OPENCLAW_CFG))["mcp"]["servers"]["lab-dev"]
-        self.url = s["url"]
-        self.auth = s["headers"]["Authorization"]
+        self.url, self.auth = jr_credentials()
         self.sid, self._id = None, 0
         r = self._post({"method": "initialize", "params": {
             "protocolVersion": "2025-03-26", "capabilities": {},
