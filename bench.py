@@ -618,6 +618,10 @@ def config_tensorfold(t, model):
         cfg["cache_k"] = cfg["cache_v"] = flag("--kv-dtype") or kv_env
     elif "tensorfold-dsv41" in image:   # DeepSeek-V4.1's engine takes no KV dtype: the model's own layout
         cfg["cache_k"] = cfg["cache_v"] = "native"
+    # DeepSeek-V4.1's TensorFold recipe reads its engram tables from a file on the NVMe by design (TF_DS_ENGRAM):
+    # the weights are all in VRAM, so its disk reads are not paging (2026-10-23: its rows grouped as "paged from SSD")
+    if any(e.startswith("TF_DS_ENGRAM=") for e in env):
+        cfg["engram_offload"] = "ssd"
     if flag("--tp"):
         cfg["tensor_parallel"] = int(flag("--tp"))
     # Drafting: an MTP head (Flash-Next) or a DFlash2 drafter checkpoint (--drafter, the GLM pair);
