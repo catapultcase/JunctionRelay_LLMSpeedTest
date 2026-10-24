@@ -175,7 +175,7 @@ that collides with a served name gets a suffix (`-ram37`); the row key ignores t
 - **A deep rung can OOM the HOST, not the card.** Flash-Next (37 layers pinned in RAM) at the
   256k rung was killed by the kernel OOM killer and took llama-swap down; systemd restarted
   it and the preload restored the daily (2026-09-25). The ladder survives it: the rung is
-  skipped, the next model's warm-up reloads, but the same model's `4k_x4` runs against a
+  skipped, the next model's warm-up reloads, but the same model's `<depth>_xN` runs against a
   dead server and reads "no clean streams" - re-run it with `--depths 4` if it matters.
 - **The journal's launch line ends in `, env: [...]`.** Deployed verbatim, llama-server
   refused every entry with `invalid argument: env:` - and because "error" matched the
