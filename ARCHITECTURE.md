@@ -5,14 +5,15 @@ Runs from one coordinating machine, measures each box in `targets.json`, and pos
 to JR over MCP as it is measured, as **JR Speed Test** (`suite_name`; JR keeps no table of
 suite names).
 
-## The suite (version 4, 2026-10-18)
+## The suite (version 5, 2026-10-24)
 
-**Scenarios are prompt depths.** One cold request per rung, tg128:
+**Scenarios are prompt depths.** The ladder is one cold request per rung at tg128; the
+concurrency rung is its own scenario, driven long enough to overlap (v5):
 
 | scenario | prompt | metrics |
 |---|---|---|
 | `4k` `16k` `32k` `64k` `128k` `256k` | the frozen corpus cut to that many tokens (cycled past 51.4K), salted, `cache_prompt=false` | `prompt_tok_s` (prefill of the whole prompt), `gen_tok_s` (next 128 tokens), `ttft_s` (server `prompt_ms`), `draft_accept`, `gpu_watts_avg` |
-| `32k_x4` (v5; the deepest rung that fits, 4K floor) | N streams at that depth, tg1024 | `gen_tok_s` (mean per stream, with its overlap factor and a WARNING note when the streams never overlapped), `gen_tok_s_aggregate` |
+| `<depth>_xN` (v5; the deepest rung that fits, 32K target / 4K floor) | N streams at that depth, tg1024 | `gen_tok_s` (mean per stream, with its overlap factor and a WARNING note when the streams never overlapped), `gen_tok_s_aggregate` |
 | — | after the run | `vram_gb`; `disk_read_mbs` and `vram_shared_gb` on the deepest rung |
 
 Every rung the window allows runs (`k·1000 + 640 ≤ ctx`). `--quick` = 4k, 32k, 128k;
@@ -32,7 +33,7 @@ v5's sustained `<depth>_xN` runs.
 | Coordinator | Any machine that reaches the boxes' APIs and ssh. It is never a target itself |
 | Targets | `targets.json` beside `bench.py` (gitignored; `JR_SPEED_TARGETS` names another path). Copy `targets.example.json`; the fields are explained above `load_targets()` in `bench.py` |
 | Engines | llama-swap in front of llama-server, or a container engine (vLLM, TensorFold) with Prometheus `/metrics`, set as `"engine": "vllm"` |
-| Ledger | JR's MCP endpoint: `JR_MCP_URL` and `JR_MCP_TOKEN`, or the `lab-dev` server in `~/.openclaw/openclaw.json` |
+| Ledger | JR's MCP endpoint: `JR_MCP_URL` + `JR_MCP_TOKEN`, else the `lab-dev` server in `~/.openclaw/openclaw.json` (otago), else the box's own OpenCode client config's `junction-relay` entry (fw13) |
 
 ## Running
 
@@ -65,9 +66,10 @@ from the `/running` launch cmd — `n_cpu_moe` (the `--n-cpu-moe` count **plus**
 `weights_gb` and `vram_gb` are read over ssh. Speeds come from the completion's
 `timings` block (activity-log fallback); wall clock is never a tok/s.
 
-## vLLM targets (2026-10-01)
+## vLLM and TensorFold targets (2026-10-01)
 
-`"engine": "vllm"` on the target. Same ladder, same metrics, different sources:
+`"engine": "vllm"` on the target (TensorFold included: `engine_of()` reads its
+`/metrics`, which publishes `tensorfold:*`). Same ladder, same metrics, different sources:
 
 | | llama-server | vLLM |
 |---|---|---|
@@ -78,19 +80,24 @@ from the `/running` launch cmd — `n_cpu_moe` (the `--n-cpu-moe` count **plus**
 
 - ⛔ **The box must be idle.** A delta is one request's only if nothing else finished inside it; the run waits for
   idle, checks `request_success` moved by exactly its own count, and retries with a fresh salt (3 tries) otherwise.
-- `gen_tok_s` is `(tokens − 1) / decode time`; on `4k_x4` it is summed tokens over summed decode time.
+- `gen_tok_s` is `(tokens − 1) / decode time`; on `<depth>_xN` it is summed tokens over summed decode time, and the row's note carries the overlap factor.
 - The top rung is cut with `/tokenize` to land under the window: vLLM refuses an over-long prompt, it does not truncate.
 - `gpu_watts_avg` on a Spark is the GPU rail only, about half the box.
 - The quant carries its publisher when the weights are not the vendor's own (`NVFP4-Mia` for
   `Mia-AiLab/...-NVFP4`; `VENDOR_ORGS` lists the orgs that post bare). `ctx` is the window one request
   gets (`--max-model-len`), not a pool divided by slots.
 - No `--gap-fill`, `--entries`, `--llama-bench` or `wont_fit`: there is no yaml and no load to refuse.
+- **TensorFold's own facts**, read from the container argv: `--kv-dtype` when the recipe passes one
+  (Flash-Next `bf16`; GLM `fp8` via `TF_GLM_KV`), else **`native`** - the engine takes no KV choice and
+  uses the model's own layout (DeepSeek-V4.1's MLA latent cache; ⛔ not f16). Thinking is `--thinking` /
+  `--no-thinking`; `--reasoning-effort` is recorded when the launch states one, else the row says `on`
+  (enabled, no effort sent). The contract's vocabulary section defines both terms for every engine.
 
 ## A rung that dies (2026-09-25)
 
 A ladder rung that crashes the server is a RESULT, not a gap. `bench_model` posts **`rung_failed`**
 (value 1, `notes` = the cause line from the box's own log: cudaMalloc / allocation / kernel OOM killer /
-segfault, via `rung_cause()`) and **stops the ladder**: every later rung and the 4-stream step would go
+segfault, via `rung_cause()`) and **stops the ladder**: every later rung and the concurrency step would go
 to a dead or reloading server and fail with no cause of their own. JR renders FAILED on that rung and
 "not reached" after it; a rung deeper than the window is N/A and posts nothing. No cause line in the log,
 nothing is recorded (the same evidence gate as a refusal).

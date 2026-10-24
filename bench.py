@@ -13,7 +13,8 @@ model an opencode agent is riding can go down mid-run without consequence.
     python3 bench.py ... --dry-run        # measure only, post nothing
     python3 bench.py ... --quick          # rungs 4k, 32k, 128k (--depths 4,32 for a custom set)
 
-Start it DETACHED (nohup). Boxes are benched one at a time, in sequence.
+Start it DETACHED (nohup). --all benches the boxes one at a time; two invocations may run
+concurrently against DIFFERENT boxes (the lock is per target, results/.lock-<box>).
 Rows that fail to post stay in results/<target>_<stamp>.json - the outbox.
 """
 import argparse
