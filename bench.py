@@ -116,6 +116,11 @@ OPENCODE_CFG = os.path.expanduser("~/.config/opencode/opencode.json")
 REQUEST_TIMEOUT = 600  # a cold model load rides the first request
 
 
+def decode_overlap(streams, wall_s):
+    """Sum each stream's measured decode seconds before dividing by wall seconds."""
+    return sum((r["output_tokens"] - 1) / r["gen_tps"] for r in streams) / wall_s if wall_s else None
+
+
 # ---------------------------------------------------------------- MCP client
 
 def jr_credentials():
@@ -1503,7 +1508,7 @@ def bench_model(api, model, machine, parallel_n, ssh_host, submit, os_kind="linu
             # serialized them and `each` is (near-)solo speed wearing a concurrency
             # label. The row says so out loud - a reader must never have to redo
             # this arithmetic to trust a cell (2026-10-24).
-            overlap = (gtoks - len(good)) / (each * wall) if each and wall else None
+            overlap = decode_overlap(good, wall)
             note = (f"mean of {len(good)}/{parallel_n} streams, {x_depth}k prompt each, tg{TG_X}"
                     + (f", overlap x{overlap:.1f}" if overlap else ""))
             if len(good) >= 2 and (each > agg or (overlap and overlap < 1.5)):
