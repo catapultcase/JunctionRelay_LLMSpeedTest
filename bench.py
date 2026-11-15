@@ -267,6 +267,24 @@ def catalog_name(serving_id):
     return re.sub(r"-(?:iq|q)\d[a-z0-9_]*$", "", s, flags=re.I)
 
 
+_RUNNING = {}
+
+
+def running_name(serving_id):
+    """The model a box is running under its alias: the catalog name of the weights its launch loaded.
+    None when serving_id is no target's alias. Raises when the launch names no weights, so no suite
+    posts a row under an alias (LLMSuiteKit's catalog_name calls this for every other suite)."""
+    t = next((t for t in TARGETS.values() if t.get("alias") == serving_id), None)
+    if not t:
+        return None
+    if serving_id not in _RUNNING:
+        repo = config_vllm(t, serving_id).get("source_repo")
+        if not repo:
+            raise RuntimeError(f"{serving_id} is an alias and its launch names no weights: the model running is unknown")
+        _RUNNING[serving_id] = catalog_name(repo.split("/")[-1])
+    return _RUNNING[serving_id]
+
+
 def resolve_model_id(ids, serving_id):
     """Catalog id for a serving id, trying progressively less specific names."""
     return (ids.get(serving_id)
@@ -2178,8 +2196,12 @@ def main():
         # catalogued is still measurable and still posts (JR flags the row and
         # models_link_benchmarks attaches it later).
         cfg = json.loads(r["configJson"] or "{}")
-        # Served under the box's alias: the weights name the model (a run posted as 'box-cd', 2026-11).
-        aliased = r["model"] in {t.get("alias") for t in TARGETS.values()} and cfg.get("source_repo")
+        # Served under the box's alias: the weights name the model, and a row whose weights
+        # cannot be read is not posted at all (a run posted as 'box-cd', 2026-11).
+        aliased = r["model"] in {t.get("alias") for t in TARGETS.values()}
+        if aliased and not cfg.get("source_repo"):
+            print(f"    !! NOT POSTED: {r['model']} is an alias and the launch names no weights - {r['metric']} {r['scenario']} stays in the outbox")
+            return
         try:
             reply = mcp.call("models_record_benchmark", {
                 "modelName": catalog_name(cfg["source_repo"].split("/")[-1] if aliased else r["model"]),
@@ -2244,7 +2266,7 @@ def main():
                   + (", posting live over MCP" if mcp else ", dry run") + " ===")
             all_rows = []
             for m in models:
-                print(f"\n[{m}]")
+                print(f"\n[{m}]" + (f" = {running_name(m)}" if running_name(m) else ""))
                 try:
                     all_rows.extend(bench_model(t["api"], m, t["machine"],
                                                 args.parallel, t["ssh"], submit, t["os"], depths, args.llb))
