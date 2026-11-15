@@ -38,6 +38,8 @@ from datetime import datetime, timezone
 #   machine       the JR machine name the rows post under
 #   ssh, peers    user@host of the box (and a pair's workers): GPU watts and the launch are read there
 #   os            "linux" or "win"; engine "vllm" for a container engine with no llama-swap
+#   alias         optional: an id the box serves under whatever it has loaded ("box-a"). A row measured
+#                 under it is named from the weights' repo, never the alias
 #   yaml, model_root, master   llama-swap's config on the box, its model folder, and the
 #                 master copy on this machine (--gap-fill and --entries; null on a container engine)
 #   log_cmd       prints the engine's recent log over ssh. ⚠️ Tail DEEP and drop the suite's own
@@ -585,19 +587,26 @@ def vllm_launch(t, model):
     """(argv, env, hf_cache) of the container serving `model`, from docker
     inspect over ssh - the launch is the only source of the setup flags."""
     _, out = _ssh(t, "docker inspect $(docker ps -q) --format "
-                     "'{{json .Id}}\t{{json .Config.Cmd}}\t{{json .Config.Env}}\t{{json .Mounts}}'")
+                     "'{{json .Id}}\t{{json .Config.Cmd}}\t{{json .Config.Env}}\t{{json .Mounts}}\t{{json .Config.Entrypoint}}'")
     for ln in out.splitlines():
         try:
-            cid, argv, env, mounts = (json.loads(x) for x in ln.split("\t"))
+            cid, argv, env, mounts, entry = (json.loads(x) for x in ln.split("\t"))
         except ValueError:
             continue
         argv = unwrap_shell(argv)
+        if argv and argv[0] == "serve" and entry:
+            argv = entry + argv      # the binary is the image's entrypoint and Cmd starts at "serve" (GLM-5.3 pair recipe, 2026-11)
         if "serve" not in argv:
             argv = serve_argv_in(t, cid) or argv   # a script launch (/start.sh) - read the live serve process
         if argv and (("--served-model-name" in argv and argv[argv.index("--served-model-name") + 1] == model)
                      or (len(argv) > 1 and os.path.basename(argv[0]).startswith("tensorfold") and argv[1] == "serve"
                          and "--name" in argv[:-1] and argv[argv.index("--name") + 1] == model)):   # tensorfold or tensorfold-native (Zig)
             hf = next((m["Source"] for m in mounts if m["Destination"].endswith(".cache/huggingface") or m["Destination"] == "/hf"), None)   # /hf: the DeepSeek-V4.1 recipe
+            # A recipe that mounts one snapshot per path (/model, /dflash2) names no repo in its argv:
+            # give each such path its host side, which does, and find the cache from it.
+            snaps = {m["Destination"]: m["Source"] for m in mounts if "/hub/models--" in m["Source"]}
+            argv = [snaps.get(a, a) for a in argv]
+            hf = hf or next((src.split("/hub/models--")[0] for src in snaps.values()), None)
             return argv, env or [], hf
     return [], [], None
 
@@ -669,8 +678,8 @@ def config_tensorfold(t, model):
     # KV: --kv-dtype on the Flash-Next recipe; the GLM pair recipe passes it as TF_GLM_KV in the
     # environment (fp8) and the server default is bf16 when neither says.
     kv_env = next((e.split("=", 1)[1] for e in env if e.startswith("TF_GLM_KV=")), None)
-    if flag("--kv-dtype") or kv_env:
-        cfg["cache_k"] = cfg["cache_v"] = flag("--kv-dtype") or kv_env
+    if flag("--kv-dtype") or flag("--kv-cache") or kv_env:      # --kv-cache: the flag's later spelling
+        cfg["cache_k"] = cfg["cache_v"] = flag("--kv-dtype") or flag("--kv-cache") or kv_env
     elif "tensorfold-dsv41" in image:   # DeepSeek-V4.1's engine takes no KV dtype: the model's own layout
         cfg["cache_k"] = cfg["cache_v"] = "native"
     # DeepSeek-V4.1's TensorFold recipe reads its engram tables from a file on the NVMe by design (TF_DS_ENGRAM):
@@ -2169,9 +2178,11 @@ def main():
         # catalogued is still measurable and still posts (JR flags the row and
         # models_link_benchmarks attaches it later).
         cfg = json.loads(r["configJson"] or "{}")
+        # Served under the box's alias: the weights name the model (a run posted as 'box-cd', 2026-11).
+        aliased = r["model"] in {t.get("alias") for t in TARGETS.values()} and cfg.get("source_repo")
         try:
             reply = mcp.call("models_record_benchmark", {
-                "modelName": catalog_name(r["model"]),
+                "modelName": catalog_name(cfg["source_repo"].split("/")[-1] if aliased else r["model"]),
                 "metric": r["metric"], "value": r["value"],
                 "machine": r["machine"], "scenario": r["scenario"],
                 # The setup as first-class fields. runtime_facts (the running

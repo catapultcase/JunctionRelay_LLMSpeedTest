@@ -15,6 +15,7 @@
   "pair-a": {
     "api": "http://192.0.2.20:8888",
     "machine": "Pair A",
+    "alias": "box-a",
     "ssh": "user@192.0.2.20",
     "peers": ["user@192.0.2.21"],
     "hardware": "Head Box Model + Worker Box Model",
