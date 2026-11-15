@@ -1561,13 +1561,13 @@ def bench_model(api, model, machine, parallel_n, ssh_host, submit, os_kind="linu
             print(f"  {scen}: no clean streams")
 
     vram = vram_gb_via_ssh(ssh_host)
-    if vram:
-        row("vram_gb", vram, None, "per-process sum via nvidia-smi over ssh")
     if llb and ssh_host:
         t_llb = next((t for t in TARGETS.values() if t["ssh"] == ssh_host), None)
         if t_llb:
             llama_bench(t_llb, model, launch_cmd, cfg.get("ctx") or 0, row)
-        print(f"  vram: {vram} GB")
+    if vram:
+        row("vram_gb", vram, None, "per-process sum via nvidia-smi over ssh")
+        print(f"  vram: {vram} GB")      # used to print only under --llama-bench; every other run said "unavailable" with the row posted
     elif os_kind == "win" and ssh_host and (g := win_gpu_process_gb(ssh_host)):
         # WDDM per-process dedicated memory - llama-server's own footprint on
         # the card, the same claim the nvidia-smi figure makes on Linux.
