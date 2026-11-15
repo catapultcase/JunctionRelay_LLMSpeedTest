@@ -1262,27 +1262,19 @@ def vram_gb_via_ssh(ssh_host):
     measurement wearing the same column heading, on a box Jon actively works on.
     Filling the gap that way would make pris and cheyenne silently
     incomparable, which is the exact failure this suite keeps having."""
-    # Three tries, and the reason printed: both pairs lost this row on 2026-11-15 with ssh
-    # answering, and a swallowed failure left nothing to read.
-    why = ""
-    for attempt in range(3):
-        if attempt:
-            time.sleep(5)
-        try:
-            r = subprocess.run(
-                ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", ssh_host,
-                 "nvidia-smi --query-compute-apps=used_memory --format=csv,noheader,nounits"],
-                capture_output=True, text=True, errors="replace", timeout=30)
-            # [N/A] rows are Windows telling us it cannot answer - not a zero.
-            mib = sum(float(x.strip()) for x in r.stdout.splitlines()
-                      if x.strip() and "N/A" not in x) if r.returncode == 0 else 0
-            if mib:
-                return round(mib / 1024, 2)
-            why = f"exit {r.returncode}: {(r.stderr or r.stdout).strip()[:200] or 'no process listed'}"
-        except Exception as e:
-            why = repr(e)[:200]
-    print(f"  vram: nvidia-smi on {ssh_host} gave nothing ({why})")
-    return None
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", ssh_host,
+             "nvidia-smi --query-compute-apps=used_memory --format=csv,noheader,nounits"],
+            capture_output=True, text=True, errors="replace", timeout=30)
+        if r.returncode != 0:
+            return None
+        # [N/A] rows are Windows telling us it cannot answer - not a zero.
+        mib = sum(float(x.strip()) for x in r.stdout.splitlines()
+                  if x.strip() and "N/A" not in x)
+        return round(mib / 1024, 2) if mib else None
+    except Exception:
+        return None
 
 
 def llama_bench_args(cmd, os_kind="linux"):
