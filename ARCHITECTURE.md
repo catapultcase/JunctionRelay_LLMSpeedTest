@@ -32,7 +32,8 @@ v5's sustained `<depth>_xN` runs.
 |---|---|
 | Coordinator | Any machine that reaches the boxes' APIs and ssh. It is never a target itself |
 | Targets | `targets.json` beside `bench.py` (gitignored; `JR_SPEED_TARGETS` names another path). Copy `targets.example.json`; the fields are explained above `load_targets()` in `bench.py` |
-| Engines | llama-swap in front of llama-server, or a container engine (vLLM, TensorFold) with Prometheus `/metrics`, set as `"engine": "vllm"` |
+| Engines | llama-swap in front of llama-server, or a container engine (vLLM, TensorFold) with Prometheus `/metrics`, set as `"engine": "vllm"`; or Strata, `"engine": "strata"` (llama-server-shaped `/props` and timings; setup from its argv and `strata --version` over ssh) |
+| API key | `"key_file"`: the key's path on the box, read over ssh into memory and sent as a Bearer header |
 | Ledger | JR's MCP endpoint: `JR_MCP_URL` + `JR_MCP_TOKEN`, else the `lab-dev` server in `~/.openclaw/openclaw.json` (otago), else the box's own OpenCode client config's `junction-relay` entry (fw13) |
 
 ## Running

@@ -310,11 +310,28 @@ def resolve_model_id(ids, serving_id):
 
 # ------------------------------------------------------------- measurement
 
+_KEYS = {}
+
+
+def api_key(url):
+    """The API key of the target serving `url`, when its entry names a `key_file` ON THE BOX: read
+    over ssh once and held in memory only - never printed, never written."""
+    t = next((t for t in TARGETS.values() if t.get("key_file") and url.startswith(t["api"])), None)
+    if not t:
+        return None
+    if t["api"] not in _KEYS:
+        code, out = _ssh(t, f"cat '{t['key_file']}'")
+        _KEYS[t["api"]] = out.strip() if code == 0 and out.strip() else None
+    return _KEYS[t["api"]]
+
+
 def http_json(url, payload=None, timeout=REQUEST_TIMEOUT):
     data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(
-        url, data=data,
-        headers={"Content-Type": "application/json"} if data else {})
+    headers = {"Content-Type": "application/json"} if data else {}
+    key = api_key(url)
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(url, data=data, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
@@ -1063,6 +1080,44 @@ def config_json(model, props, cmd, t_ssh=None):
     return cfg
 
 
+def config_strata(t, model):
+    """Strata (`"engine": "strata"`): a llama-server-shaped /props gives the window and slots; the
+    engine's own argv over ssh gives the GGUF it loaded (--native), --kv and --spec; the launcher's
+    `strata --version` gives the release and the engine build."""
+    try:
+        props = http_json(f"{t['api']}/props", timeout=60)
+    except Exception:
+        props = {}
+    cfg = config_json(model, props, "", t["ssh"])
+    cfg.pop("load_mode", None)   # config_json reads llama-server's mmap flags off a command line Strata does not have
+    _, argv = _ssh(t, "pgrep -af 'strata --serve' | grep -v pgrep | head -1")
+    _, ver = _ssh(t, f"{t.get('strata_bin', '$HOME/.local/bin/strata')} --version")
+    m = re.search(r"strata\s+(\S+)\s+\(build\s+([^;)]+)", ver)
+    if m:
+        cfg["engine"] = f"Strata {m.group(1)} (engine {m.group(2)})"
+        cfg["engine_name"], cfg["engine_version"] = "Strata", m.group(1)
+    m = re.search(r"--kv\s+(\S+)", argv)
+    if m:
+        cfg["cache_k"] = m.group(1)
+    m = re.search(r"--spec\s+(\d+)", argv)
+    if m and int(m.group(1)) > 0:
+        cfg["spec_type"], cfg["spec_tokens"] = "mtp", int(m.group(1))
+    cfg["vision"] = "--vision" in argv.split()
+    m = re.search(r"--native\s+(\S+\.gguf)", argv)
+    if m:
+        path = m.group(1)
+        q = re.search(r"((?:UD-)?I?Q\d[\w_]*|BF16|F16)", path.split("/")[-1], re.I)
+        if q:
+            cfg["quant"] = q.group(1)
+        cfg["source_repo"] = source_repo(t, path)
+        # the model the row names: the weights file's stem, as a llama-swap id names it
+        cfg["weights_name"] = re.sub(r"(-\d{5}-of-\d{5})?\.gguf$", "", path.split("/")[-1])
+        gb = weights_gb_via_ssh(t["ssh"], path)
+        if gb:
+            cfg["weights_gb"] = gb
+    return cfg
+
+
 def assert_gpu(machine, ssh_host, proc="llama-server", container=False):
     """⛔ NEVER PERMIT CPU-ONLY (Jon, 2026-08-27). llama.cpp's dynamic backend
     loader falls back to CPU SILENTLY when the CUDA backend cannot load - on
@@ -1388,6 +1443,7 @@ def bench_model(api, model, machine, parallel_n, ssh_host, submit, os_kind="linu
 
     t_box = next((t for t in TARGETS.values() if t["api"] == api), {})
     vllm = t_box.get("engine") == "vllm"
+    strata = t_box.get("engine") == "strata"
     wait_quiet(t_box)
     print("  warm-up (may include model load)...")
     run_one(api, model, warmup_prompt(), 16)
@@ -1400,10 +1456,13 @@ def bench_model(api, model, machine, parallel_n, ssh_host, submit, os_kind="linu
     else:
         run_one(api, model, ladder_prompt(4), 16, cache_prompt=False, timeout=3600)
     engine = engine_of(api) if vllm else "llama-server"
-    assert_gpu(machine, ssh_host, engine if vllm else "llama-server", container=vllm)  # every model, after load, before any row
+    assert_gpu(machine, ssh_host, engine if vllm else "strata" if strata else "llama-server", container=vllm)  # every model, after load, before any row
     if vllm:
         launch_cmd = ""
         cfg = config_vllm(t_box, model)
+    elif strata:
+        launch_cmd = ""
+        cfg = config_strata(t_box, model)
     else:
         try:
             props = http_json(f"{api}/upstream/{model}/props", timeout=60)
@@ -1512,7 +1571,7 @@ def bench_model(api, model, machine, parallel_n, ssh_host, submit, os_kind="linu
     # 4-slot 32K window's KV and read "no clean streams" (2026-09-25).
     x_depth = next((k for k in (32, 16, 8, 4)
                     if not ctx or k * 1000 + TG_X + 1024 <= ctx), 4) if rungs and not crashed else None
-    if x_depth:
+    if x_depth and parallel_n > 1:   # --parallel 1: a one-slot server, nothing concurrent to measure
         scen = f"{x_depth}k_x{parallel_n}"
         results, threads = [None] * parallel_n, []
         watts = WattsSampler(ssh_host) if ssh_host else None
@@ -2219,7 +2278,7 @@ def main():
             return
         try:
             reply = mcp.call("models_record_benchmark", {
-                "modelName": catalog_name(cfg["source_repo"].split("/")[-1] if aliased else r["model"]),
+                "modelName": catalog_name(cfg["source_repo"].split("/")[-1] if aliased else cfg.get("weights_name") or r["model"]),
                 "metric": r["metric"], "value": r["value"],
                 "machine": r["machine"], "scenario": r["scenario"],
                 # The setup as first-class fields. runtime_facts (the running
@@ -2288,7 +2347,7 @@ def main():
                 except SystemExit:
                     raise
                 except Exception as e:
-                    if t.get("engine") == "vllm":
+                    if t.get("engine") in ("vllm", "strata"):
                         # No llama-swap to settle and no load to refuse: the server
                         # was already up, so a failure here is not a fit verdict.
                         print(f"  FAILED: {e} - no rows recorded for this model")
